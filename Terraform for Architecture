@@ -1,1 +1,341 @@
+provider "aws" {
+  region = "us-east-1"
+}
+
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "3.11.0"
+
+  name                 = "App-Plane-vpc"
+  cidr                 = "10.1.0.0/16"
+  azs                  = ["us-east-1a", "us-east-1b"]
+  private_subnets      = ["10.1.2.0/24", "10.1.3.0/24"]
+  public_subnets       = ["10.1.0.0/24", "10.1.1.0/24"]
+  database_subnets     = ["10.1.4.0/24", "10.1.5.0/24"]
+  enable_nat_gateway   = true
+  single_nat_gateway   = true
+  enable_dns_hostnames = true
+}
+
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+
+# Instance for Windows Server 2019 in Public Subnet 1
+resource "aws_security_group" "bastion1_sg" {
+  name_prefix = "bastion1_sg"
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    description = "Allow RDP access"
+    from_port   = 3389
+    to_port     = 3389
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "bastion1" {
+  ami                    = "ami-024614f01f42eeb66"
+  instance_type          = "t3a.medium"
+  subnet_id              = module.vpc.public_subnets[0]
+  associate_public_ip_address = true
+  availability_zone      = module.vpc.azs[0]
+  user_data              = <<-EOF
+                             <powershell>
+                             net user Administrator mypassword123!
+                             </powershell>
+                           EOF
+  
+  tags = {
+    Name = "bastion1"
+  }
+
+  root_block_device {
+    volume_size = 50
+  }
+  
+  vpc_security_group_ids = [
+    aws_security_group.bastion1_sg.id
+  ]
+}
+
+# Instance for RedHat in Subnet 1
+resource "aws_instance" "wpserver1" {
+  ami                    = "ami-0c9978668f8d55984"
+  instance_type          = "t3a.micro"
+  subnet_id              = module.vpc.private_subnets[0]
+  availability_zone      = module.vpc.azs[0]
+  tags = {
+    Name = "wpserver1"
+  }
+
+  root_block_device {
+    volume_size = 20
+  }
+  
+  vpc_security_group_ids = [
+    aws_security_group.wpserver_sg.id
+  ]
+}
+
+# Instance for RedHat in Subnet 2
+resource "aws_instance" "wpserver2" {
+  ami                    = "ami-0c9978668f8d55984"
+  instance_type          = "t3a.micro"
+  subnet_id              = module.vpc.private_subnets[1]
+  availability_zone      = module.vpc.azs[1]
+  tags = {
+    Name = "wpserver2"
+  }
+
+  root_block_device {
+    volume_size = 20
+  }
+  
+  vpc_security_group_ids = [
+    aws_security_group.wpserver_sg.id
+  ]
+}
+
+# Security group for wpserver1 and wpserver2 instances
+resource "aws_security_group" "wpserver_sg" {
+  name_prefix = "wpserver_sg"
+  vpc_id = module.vpc.vpc_id
+  
+  ingress {
+    description = "Allow SSH access from bastion1"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    security_groups = [
+      aws_security_group.bastion1_sg.id
+    ]
+  }
+}
+
+resource "aws_db_subnet_group" "RDS1" {
+  name        = "rds1-subnet-group"
+  description = "Subnet group for RDS1"
+
+  subnet_ids = [
+    aws_subnet.database_subnets[0].id,
+    aws_subnet.database_subnets[1].id
+  ]
+
+  tags = {
+    Name = "rds1-subnet-group"
+  }
+}
+
+# RDS Instance
+resource "aws_db_instance" "RDS1" {
+  db_subnet_group_name     = module.vpc.database_subnets[1]
+  engine                   = "postgres"
+  identifier               = "rds1"
+  instance_class           = "db.t3.micro"
+  multi_az                 = false
+  allocated_storage        = 10
+  db_name                  = "RDS1"
+  password                 = "supersecurepassword.123"
+  port                     = 5432
+  publicly_accessible      = true
+  storage_encrypted        = true 
+  storage_type             = "gp2"
+  username                 = "RDS1"
+  vpc_security_group_ids   = ["${aws_security_group.RDS1.id}"]
+}
+
+resource "aws_security_group" "RDS1" {
+  name = "RDS1"
+  description = "RDS postgres servers (terraform-managed)"
+  vpc_id = "${module.vpc.vpc_id}"
+
+  ingress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["10.1.0.0/16"]
+  }
+
+  # Allow all outbound traffic.
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Application Load Balancer (ALB)
+resource "aws_lb" "app-plane-alb" {
+  name               = "app-plane-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = [module.vpc.private_subnets[0], module.vpc.private_subnets[1]]
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
+}
+
+# ALB Listeners
+resource "aws_lb_listener" "http_listener" {
+  load_balancer_arn = aws_lb.app-plane-alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    target_group_arn = aws_lb_target_group.my_tg.arn
+    type             = "forward"
+  }
+}
+
+# ALB Target Group
+resource "aws_lb_target_group" "my_tg" {
+  name        = "app-plane-tg"
+  port        = 80
+  protocol    = "HTTP"
+  target_type = "instance"
+  vpc_id      = module.vpc.vpc_id
+
+  health_check {
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    timeout             = 5
+    interval            = 30
+    path                = "/"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+  }
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
+}
+
+# ALB Target Group Attachment
+resource "aws_lb_target_group_attachment" "my_tg_attachment" {
+  target_group_arn = aws_lb_target_group.my_tg.arn
+  target_id        = aws_instance.wpserver1.id
+  port             = 80
+}
+
+# Create a new Route53 hosted zone
+resource "aws_route53_zone" "thisisafakenameforthistest123456131312312311231231-com" {
+  name = "thisisafakenameforthistest123456131312312311231231.com."
+}
+
+# Add an NS record to delegate subdomains of example.com to another DNS service
+resource "aws_route53_record" "thisisafakenameforthistest123456131312312311231231-com-ns" {
+  zone_id = aws_route53_zone.thisisafakenameforthistest123456131312312311231231-com.zone_id
+
+  name    = "thisisafakenameforthistest123456131312312311231231.com."
+  type    = "NS"
+  ttl     = "3600"
+
+  records = [
+    "ns1.otherdns.com.",
+    "ns2.otherdns.com.",
+  ]
+}
+
+resource "aws_route53_record" "thisisafakenameforthistest123456131312312311231231-com" {
+  zone_id = aws_route53_zone.thisisafakenameforthistest123456131312312311231231-com.zone_id
+
+  name    = "thisisafakenameforthistest123456131312312311231231.com"
+  type    = "A"
+  alias {
+    name                   = aws_lb.app-plane-alb.dns_name
+    zone_id                = aws_lb.app-plane-alb.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# AWS IAM Policy
+resource "aws_iam_policy" "cw_canary_iam_policy" {
+  name        = "cw-canary-iam-policy"
+  path        = "/"
+  description = "CloudWatch Canary Synthetic IAM Policy"
+
+  # Terraform's "jsonencode" function converts a
+  # Terraform expression result to valid JSON syntax.
+  policy = jsonencode({
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": "cloudwatch:PutMetricData",
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "cloudwatch:namespace": "CloudWatchSynthetics"
+                }
+            }
+        },
+        {
+            "Sid": "VisualEditor1",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "logs:CreateLogStream",
+                "s3:ListAllMyBuckets",
+                "logs:CreateLogGroup",
+                "logs:PutLogEvents",
+                "s3:GetBucketLocation",
+                "xray:PutTraceSegments"
+            ],
+            "Resource": "*"
+        }
+    ]
+})
+}
+
+# AWS IAM Role
+resource "aws_iam_role" "cw_canary_iam_role" {
+  name                = "cw-canary-iam-role"
+  description = "CloudWatch Synthetics lambda execution role for running canaries"
+  path = "/service-role/"
+  #assume_role_policy  = data.aws_iam_policy_document.instance_assume_role_policy.json # (not shown)
+  assume_role_policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}" 
+  managed_policy_arns = [aws_iam_policy.cw_canary_iam_policy.arn]
+}
+
+resource "aws_s3_bucket" "b" {
+  bucket = "my-tf-test-bucket-12358197123614198371093981658910938018381"
+
+  tags = {
+    Name        = "My bucket"
+    Environment = "Dev"
+  }
+}
+
+resource "aws_s3_bucket_acl" "example" {
+  bucket = aws_s3_bucket.b.id
+  acl    = "private"
+}
+
+
+# AWS CloudWatch Canary
+resource "aws_synthetics_canary" "web_application_alive" {
+  name                 = "web_application_alive"
+  artifact_s3_location = "s3://${aws_s3_bucket.b.id}/web_application_alive"
+  execution_role_arn   = aws_iam_role.cw_canary_iam_role.arn 
+  handler              = "web_application_alive.handler"
+  zip_file             = "web_application_alive/sswebsite2v1.zip"
+  runtime_version      = "syn-nodejs-puppeteer-3.1"
+  start_canary = true
+
+  run_config {
+    active_tracing = true
+    memory_in_mb = 960
+    timeout_in_seconds = 60
+  }
+  schedule {
+    expression = "rate(1 minute)"
+  }
+}
 
