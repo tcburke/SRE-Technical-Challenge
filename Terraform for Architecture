@@ -66,6 +66,7 @@ resource "aws_instance" "wpserver1" {
   instance_type          = "t3a.micro"
   subnet_id              = module.vpc.private_subnets[0]
   availability_zone      = module.vpc.azs[0]
+  key_name = "New"
   tags = {
     Name = "wpserver1"
   }
@@ -85,6 +86,7 @@ resource "aws_instance" "wpserver2" {
   instance_type          = "t3a.micro"
   subnet_id              = module.vpc.private_subnets[1]
   availability_zone      = module.vpc.azs[1]
+  key_name = "New"
   tags = {
     Name = "wpserver2"
   }
@@ -114,23 +116,18 @@ resource "aws_security_group" "wpserver_sg" {
   }
 }
 
-resource "aws_db_subnet_group" "RDS1" {
-  name        = "rds1-subnet-group"
-  description = "Subnet group for RDS1"
-
-  subnet_ids = [
-    aws_subnet.database_subnets[0].id,
-    aws_subnet.database_subnets[1].id
-  ]
+resource "aws_db_subnet_group" "default" {
+  name       = "main"
+  subnet_ids = [module.vpc.database_subnets[0], module.vpc.database_subnets[1]]
 
   tags = {
-    Name = "rds1-subnet-group"
+    Name = "My DB subnet group"
   }
 }
 
 # RDS Instance
 resource "aws_db_instance" "RDS1" {
-  db_subnet_group_name     = module.vpc.database_subnets[1]
+  db_subnet_group_name     = aws_db_subnet_group.default.name
   engine                   = "postgres"
   identifier               = "rds1"
   instance_class           = "db.t3.micro"
@@ -338,4 +335,3 @@ resource "aws_synthetics_canary" "web_application_alive" {
     expression = "rate(1 minute)"
   }
 }
-
